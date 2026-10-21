@@ -408,23 +408,66 @@ fn a_silent_role_still_gets_the_preamble_and_the_protocol_before_its_instruction
 
 #[test]
 fn a_run_goes_from_delegation_to_finish() {
+    run_goes_from_delegation_to_finish(false);
+}
+
+#[test]
+fn a_headless_run_can_be_driven_externally_from_delegation_to_finish() {
+    run_goes_from_delegation_to_finish(true);
+}
+
+fn run_goes_from_delegation_to_finish(headless: bool) {
     let repo = TempRepo::new();
     let world = TestWorld::new();
     common::install_pottery_plugin(&world, &repo.path());
     let env = world.env();
     let catalog = fixture_catalog();
 
-    let fire = parse(&[
-        "meta", "fire", "--prompt", "plan", "--repo", &repo.path().to_string_lossy(),
+    let repo_path = repo.path().to_string_lossy().to_string();
+    let mut fire_args = vec![
+        "meta", "fire", "--prompt", "plan", "--repo", &repo_path,
         "--name", "run-g", "--agent", "claude",
-    ]);
-    let meta_result = run_json(fire, &env, &catalog);
+    ];
+    if headless {
+        fire_args.push("--headless");
+    }
+    let meta_result = run_json(parse(&fire_args), &env, &catalog);
     let run_id = meta_result["run_id"].as_str().unwrap().to_string();
+    let store = oat_agents::store::Store::open(&env).unwrap();
+    let meta_dispatch_id = meta_result["dispatch_id"].as_str().unwrap();
+    let meta_dispatch = store.load_dispatch(&run_id, meta_dispatch_id).unwrap();
+    assert_eq!(meta_dispatch.headless, headless);
+    if headless {
+        assert_eq!(meta_result["headless"], true);
+        assert!(meta_result.get("session").is_none());
+        assert!(meta_result.get("attach").is_none());
+        assert!(world.tmux_calls().is_empty(), "headless fire never invokes tmux");
+        assert_eq!(meta_dispatch.role, "oat-meta");
+        assert_eq!(serde_json::to_value(&meta_dispatch).unwrap()["headless"], true);
+        let worktree = std::path::Path::new(&meta_dispatch.worktree);
+        assert!(worktree.exists());
+        assert_eq!(git(worktree, &["branch", "--show-current"]), meta_result["branch"]);
+        let dispatch_dir = std::path::Path::new(meta_result["dispatch_dir"].as_str().unwrap());
+        assert!(std::fs::read_to_string(dispatch_dir.join("prompt.md")).unwrap().contains("plan"));
+        assert!(dispatch_dir.join("launch.sh").is_file());
+    }
 
     let meta_env = world.env().with_var("OAT_RUN_ID", &run_id);
     let role_fire = parse(&["role", "fire", "worker", "--name", "w1", "--prompt", "do work"]);
     let role_result = run_json(role_fire, &meta_env, &catalog);
     let dispatch_id = role_result["dispatch_id"].as_str().unwrap().to_string();
+    if headless {
+        let member = store.load_dispatch(&run_id, &dispatch_id).unwrap();
+        assert!(!member.headless);
+        let calls = world.tmux_calls();
+        let launches: Vec<_> = calls.iter().filter(|call| call.contains("new-session")).collect();
+        assert_eq!(launches.len(), 1, "{calls:?}");
+        assert!(launches[0].contains(role_result["session"].as_str().unwrap()));
+        assert_eq!(
+            git(std::path::Path::new(&member.worktree), &["rev-parse", "HEAD"]),
+            git(std::path::Path::new(&meta_dispatch.worktree), &["rev-parse", "HEAD"]),
+        );
+    }
 
     // The worker asks a question; this blocks, so it runs on its own thread while the
     // meta-agent answers it with `run reply`.
@@ -440,14 +483,14 @@ fn a_run_goes_from_delegation_to_finish() {
     // The meta-agent receives the question through its own `run wait`, acknowledges the
     // delivery, and only then replies to it — the Run inbox is how it learns the message id.
     std::thread::sleep(std::time::Duration::from_millis(200));
-    let wait_for_question = parse(&["run", "wait", "--run", &run_id, "--ack", "--timeout-ms", "5000"]);
+    let wait_for_question = parse(&["run", "wait", "--ack", "--timeout-ms", "5000"]);
     let question_delivery = run_json(wait_for_question, &meta_env, &catalog);
     assert_eq!(question_delivery["timed_out"], false);
     assert_eq!(question_delivery["messages"][0]["kind"], "question");
     let question_seq = question_delivery["messages"][0]["seq"].as_u64().unwrap();
 
     let reply_cli = parse(&[
-        "run", "reply", "--run", &run_id, "--message", &question_seq.to_string(), "--prompt", "cobalt",
+        "run", "reply", "--message", &question_seq.to_string(), "--prompt", "cobalt",
     ]);
     run_json(reply_cli, &meta_env, &catalog);
 
@@ -463,18 +506,26 @@ fn a_run_goes_from_delegation_to_finish() {
     run_json(done_cli, &worker_env, &catalog);
 
     // The meta-agent waits again, receives the member_done delivery, and acknowledges it.
-    let wait_cli = parse(&["run", "wait", "--run", &run_id, "--ack", "--timeout-ms", "5000"]);
+    let wait_cli = parse(&["run", "wait", "--ack", "--timeout-ms", "5000"]);
     let wait_result = run_json(wait_cli, &meta_env, &catalog);
     assert_eq!(wait_result["timed_out"], false);
     assert_eq!(wait_result["messages"][0]["kind"], "member_done");
 
     // The meta-agent releases the Dispatch and its worktree, then finishes the Run.
-    let release_cli = parse(&["dispatch", "release", "--dispatch", &dispatch_id, "--run", &run_id, "--remove-worktree", "--force"]);
+    let release_cli = parse(&["dispatch", "release", "--dispatch", &dispatch_id, "--remove-worktree", "--force"]);
     run_json(release_cli, &meta_env, &catalog);
 
-    let finish_cli = parse(&["meta", "finish", "--run", &run_id]);
+    let calls_before_finish = world.tmux_calls();
+    let finish_cli = parse(&["meta", "finish"]);
     let finish_result = run_json(finish_cli, &meta_env, &catalog);
     assert!(finish_result["closed_at"].is_string());
+    if headless {
+        assert_eq!(world.tmux_calls(), calls_before_finish, "no meta session to kill");
+        assert!(!store.load_run(&run_id).unwrap().is_open());
+        let meta = store.load_dispatch(&run_id, meta_dispatch_id).unwrap();
+        assert!(meta.is_settled());
+        assert!(meta.released_at.is_some());
+    }
 
     let log_cli = parse(&["log", "show", "--run", &run_id, "--format", "json"]);
     let log_result = run_json(log_cli, &meta_env, &catalog);

@@ -6,7 +6,7 @@ pub mod skills;
 
 use crate::environment::Environment;
 use crate::error::{codes, err};
-use crate::event_log::{events, hash_id, now_iso, EventLog, LogEntry};
+use crate::event_log::{events, now_iso, EventLog, LogEntry};
 use crate::role::{Backend, ModelSetting, SkillRef};
 use crate::session::tmux::Tmux;
 use crate::store::{DispatchRecord, RunRecord, Store};
@@ -72,9 +72,7 @@ pub(crate) const PASS_THROUGH_VARS: &[&str] = &[
     "CODEX_HOME",
 ];
 
-/// Materializes the Dispatch's skills, writes `prompt.md` and `launch.sh`, starts the tmux
-/// session, and records the Dispatch. On a skill conflict, a worktree this call created is
-/// removed so nothing is left half-prepared (ticket §6.2 rule 3).
+/// Prepares a Dispatch, starts its tmux session, then records the successful launch.
 pub fn launch_dispatch(
     env: &dyn Environment,
     store: &Store,
@@ -83,9 +81,50 @@ pub fn launch_dispatch(
     dispatch_id: String,
     model_env: (Option<String>, Option<String>),
 ) -> Result<(DispatchRecord, PathBuf)> {
-    let tmux = Tmux::from_env(env);
-    tmux.check_available()?;
+    Tmux::from_env(env).check_available()?;
+    let (dispatch, dispatch_dir) =
+        prepare_dispatch_files(store, &spec, dispatch_id, model_env, false)?;
+    if let Err(e) = start_dispatch(env, &spec.run, &dispatch, &dispatch_dir) {
+        if spec.created_fresh_worktree {
+            let _ = worktree::remove_worktree(
+                &spec.repo,
+                &spec.worktree,
+                &spec.branch,
+                &spec.run.base_branch,
+                true,
+            );
+        }
+        return Err(e);
+    }
+    record_dispatch(store, log, &dispatch)?;
+    Ok((dispatch, dispatch_dir))
+}
 
+/// Materializes skills, writes `prompt.md` and `launch.sh`, and records the Dispatch,
+/// without invoking tmux. On a skill conflict, a fresh worktree is removed so nothing
+/// is left half-prepared (ticket §6.2 rule 3).
+pub fn prepare_dispatch(
+    store: &Store,
+    log: &EventLog,
+    spec: &LaunchSpec,
+    dispatch_id: String,
+    model_env: (Option<String>, Option<String>),
+    headless: bool,
+) -> Result<(DispatchRecord, PathBuf)> {
+    let (dispatch, dispatch_dir) =
+        prepare_dispatch_files(store, spec, dispatch_id, model_env, headless)?;
+    record_dispatch(store, log, &dispatch)?;
+    Ok((dispatch, dispatch_dir))
+}
+
+/// Writes the launch files without recording a Dispatch or emitting agent_enter.
+fn prepare_dispatch_files(
+    store: &Store,
+    spec: &LaunchSpec,
+    dispatch_id: String,
+    model_env: (Option<String>, Option<String>),
+    headless: bool,
+) -> Result<(DispatchRecord, PathBuf)> {
     if let Err(e) = skills::materialize_skills(&spec.worktree, spec.backend, &spec.skills) {
         if spec.created_fresh_worktree {
             let _ = worktree::remove_worktree(
@@ -157,42 +196,7 @@ pub fn launch_dispatch(
         fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))?;
     }
 
-    let hid = hash_id(
-        if spec.is_core { "meta" } else { &spec.role_label },
-        spec.name.as_deref().unwrap_or(&spec.run.name),
-        &dispatch_id,
-    );
-    let session = Tmux::session_name(&hid);
-
     let (model, effort) = model_env;
-    let mut env_vars = vec![
-        ("OAT_RUN_ID".to_string(), spec.run.id.clone()),
-        ("OAT_DISPATCH_ID".to_string(), dispatch_id.clone()),
-        ("OAT_WORKTREE".to_string(), spec.worktree.to_string_lossy().to_string()),
-        (
-            "OAT_DISPATCH_DIR".to_string(),
-            dispatch_dir.to_string_lossy().to_string(),
-        ),
-    ];
-    if let Some(m) = &model {
-        env_vars.push(("OAT_MODEL".to_string(), m.clone()));
-    }
-    if let Some(e) = &effort {
-        env_vars.push(("OAT_EFFORT".to_string(), e.clone()));
-    }
-    for name in PASS_THROUGH_VARS {
-        if let Some(v) = env.var(name) {
-            env_vars.push((name.to_string(), v));
-        }
-    }
-
-    tmux.start_session(
-        &session,
-        &spec.worktree,
-        &env_vars,
-        &script_path.to_string_lossy(),
-    )?;
-
     let dispatch = DispatchRecord {
         id: dispatch_id.clone(),
         run_id: spec.run.id.clone(),
@@ -210,20 +214,61 @@ pub fn launch_dispatch(
         name: spec.name.clone(),
         model,
         effort,
+        headless,
     };
-    debug_assert_eq!(dispatch.hash_id(&spec.run), hid);
-    store.create_dispatch(&dispatch)?;
+    Ok((dispatch, dispatch_dir))
+}
+
+fn record_dispatch(store: &Store, log: &EventLog, dispatch: &DispatchRecord) -> Result<()> {
+    store.create_dispatch(dispatch)?;
 
     log.record(&LogEntry {
         timestamp: now_iso(),
-        run_id: spec.run.id.clone(),
-        dispatch_id: Some(dispatch_id.clone()),
-        agent: Some(spec.role_label.clone()),
+        run_id: dispatch.run_id.clone(),
+        dispatch_id: Some(dispatch.id.clone()),
+        agent: Some(dispatch.role.clone()),
         event: events::AGENT_ENTER.to_string(),
         details: Some(serde_json::json!({"worktree": dispatch.worktree, "backend": dispatch.backend})),
     })?;
 
-    Ok((dispatch, dispatch_dir))
+    Ok(())
+}
+
+/// Starts a prepared Dispatch with the same session name and environment as a regular launch.
+pub fn start_dispatch(
+    env: &dyn Environment,
+    run: &RunRecord,
+    dispatch: &DispatchRecord,
+    dispatch_dir: &Path,
+) -> Result<()> {
+    let session = Tmux::session_name(&dispatch.hash_id(run));
+    let mut env_vars = vec![
+        ("OAT_RUN_ID".to_string(), run.id.clone()),
+        ("OAT_DISPATCH_ID".to_string(), dispatch.id.clone()),
+        ("OAT_WORKTREE".to_string(), dispatch.worktree.clone()),
+        (
+            "OAT_DISPATCH_DIR".to_string(),
+            dispatch_dir.to_string_lossy().to_string(),
+        ),
+    ];
+    if let Some(m) = &dispatch.model {
+        env_vars.push(("OAT_MODEL".to_string(), m.clone()));
+    }
+    if let Some(e) = &dispatch.effort {
+        env_vars.push(("OAT_EFFORT".to_string(), e.clone()));
+    }
+    for name in PASS_THROUGH_VARS {
+        if let Some(v) = env.var(name) {
+            env_vars.push((name.to_string(), v));
+        }
+    }
+
+    Tmux::from_env(env).start_session(
+        &session,
+        Path::new(&dispatch.worktree),
+        &env_vars,
+        &dispatch_dir.join("launch.sh").to_string_lossy(),
+    )
 }
 
 /// Claude Code workspace-trust handling (ticket §4.5): `--trust-workspace` records the

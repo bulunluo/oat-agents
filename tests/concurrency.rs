@@ -61,6 +61,56 @@ fn log_events(world: &TestWorld, run_id: &str) -> Vec<String> {
 }
 
 #[test]
+#[cfg(unix)]
+fn a_failed_tmux_start_leaves_no_dispatch_log_entry_or_held_slot() {
+    use oat_agents::store::Store;
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = TempRepo::new();
+    let world = TestWorld::new();
+    install_limited_plugin(&world, &repo.path());
+    run(
+        parse(&[
+            "meta", "fire", "--headless", "--prompt", "plan", "--repo",
+            &repo.path().to_string_lossy(), "--name", "kiln", "--agent", "claude",
+        ]),
+        &world.env(),
+    ).unwrap();
+    let before = log_events(&world, "kiln");
+    let failing_tmux = world.scratch.path().join("failing-tmux.sh");
+    std::fs::write(
+        &failing_tmux,
+        "#!/bin/sh\nif [ \"$3\" = new-session ]; then\n  echo 'start refused' >&2\n  exit 1\nfi\nexit 0\n",
+    ).unwrap();
+    std::fs::set_permissions(&failing_tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let env = world.env()
+        .with_var("OAT_RUN_ID", "kiln")
+        .with_var("OAT_TMUX_COMMAND", failing_tmux.to_string_lossy().to_string());
+    let error = run(
+        parse(&["role", "fire", "worker", "--name", "bowl", "--prompt", "throw a pot"]),
+        &env,
+    ).unwrap_err();
+    let failure = to_failure(&error);
+    assert_eq!(failure.code, codes::INTERNAL_ERROR);
+    assert!(failure.message.contains("tmux new-session failed: start refused"), "{failure:?}");
+
+    let store = Store::open(&env).unwrap();
+    let dispatches = store.list_dispatches("kiln");
+    assert_eq!(dispatches.len(), 1, "only the headless meta Dispatch remains: {dispatches:?}");
+    assert_eq!(dispatches[0].role, "oat-meta");
+    assert_eq!(log_events(&world, "kiln"), before, "a failed start must not log agent_enter");
+    let worktree = std::path::PathBuf::from(format!("{}.oat-kiln-bowl", repo.path().display()));
+    assert!(!worktree.exists(), "a failed start must remove its fresh worktree");
+
+    let launched = fire_worker(&world, "kiln", "bowl");
+    assert!(launched["queued"].is_null(), "the failed start must free its slot: {launched}");
+    assert!(launched["dispatch_id"].is_string(), "{launched}");
+    assert!(worktree.exists(), "the same worktree name can be launched again");
+    assert_eq!(store.list_dispatches("kiln").len(), 2);
+    assert!(world.tmux_calls().iter().any(|call| call.contains("new-session")));
+}
+
+#[test]
 fn a_role_at_its_plugin_default_queues_and_starts_once_a_dispatch_settles() {
     let repo = TempRepo::new();
     let world = TestWorld::new();

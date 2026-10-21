@@ -283,6 +283,7 @@ mod tests {
             name: name.map(str::to_string),
             model: None,
             effort: None,
+            headless: false,
         }
     }
 

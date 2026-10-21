@@ -22,7 +22,7 @@ use std::str::FromStr;
 #[derive(Subcommand, Debug)]
 pub enum MetaCommand {
     /// Start a Run from a goal: create the meta-agent's worktree and launch it in its own tmux
-    /// session.
+    /// session, unless `--headless` is set.
     Fire(FireArgs),
     /// Close a Run whose Dispatches are settled and released, and print its receipt.
     Finish(FinishArgs),
@@ -54,6 +54,9 @@ pub struct FireArgs {
     pub exec_profile: Option<String>,
     #[arg(long)]
     pub no_exec: bool,
+    /// Prepare the Run for an external driver without starting a meta-agent tmux session.
+    #[arg(long)]
+    pub headless: bool,
 }
 
 #[derive(Args, Debug)]
@@ -199,29 +202,32 @@ fn fire(args: FireArgs, env: &dyn Environment) -> Result<Value> {
         repo: repo.clone(),
     };
 
-    let (dispatch, dispatch_dir) = launch::launch_dispatch(
-        env,
-        &store,
-        &log,
-        spec,
-        dispatch_id.clone(),
-        (model.model.clone(), model.reasoning_effort.clone()),
-    )?;
+    let model_env = (model.model.clone(), model.reasoning_effort.clone());
+    let (dispatch, dispatch_dir) = if args.headless {
+        launch::prepare_dispatch(&store, &log, &spec, dispatch_id, model_env, true)?
+    } else {
+        launch::launch_dispatch(env, &store, &log, spec, dispatch_id, model_env)?
+    };
 
-    let session = Tmux::session_name(&dispatch.hash_id(&run_record));
-    Ok(json!({
+    let mut result = json!({
         "run_id": run_id,
         "dispatch_id": dispatch.id,
         "worktree": dispatch.worktree,
         "branch": dispatch.branch,
-        "session": session,
-        "attach": Tmux::from_env(env).attach_command(&session),
         "dispatch_dir": dispatch_dir.to_string_lossy(),
         "exec": exec.to_json(),
         "backend": run_record.backend,
         "role_limits": run_record.role_limits,
         "role_settings": run_record.role_settings,
-    }))
+    });
+    if args.headless {
+        result["headless"] = json!(true);
+    } else {
+        let session = Tmux::session_name(&dispatch.hash_id(&run_record));
+        result["attach"] = json!(Tmux::from_env(env).attach_command(&session));
+        result["session"] = json!(session);
+    }
+    Ok(result)
 }
 
 /// Which execution profile a Run got, and why — reported in `meta fire`'s output and the
@@ -318,8 +324,10 @@ fn finish(args: FinishArgs, env: &dyn Environment, exec: &dyn ExecEnvironments) 
     }
 
     let meta_dispatch_id = run_record.meta_dispatch_id.clone();
+    let mut headless = false;
     if let Some(dispatch_id) = &meta_dispatch_id {
         if let Ok(mut dispatch) = store.load_dispatch(&run_id, dispatch_id) {
+            headless = dispatch.headless;
             if dispatch.settled.is_none() {
                 dispatch.settled = Some(crate::store::Settlement::Succeeded);
                 dispatch.released_at = Some(now_iso());
@@ -358,7 +366,7 @@ fn finish(args: FinishArgs, env: &dyn Environment, exec: &dyn ExecEnvironments) 
 
     // The receipt above is what settles the Run; killing the meta-agent's own tmux session
     // is the last thing that happens, after cleanup is scheduled, never before.
-    if let Some(dispatch_id) = &meta_dispatch_id {
+    if let Some(dispatch_id) = meta_dispatch_id.as_ref().filter(|_| !headless) {
         let tmux = crate::session::tmux::Tmux::from_env(env);
         let hid = crate::event_log::hash_id("meta", &run_record.name, dispatch_id);
         let session = crate::session::tmux::Tmux::session_name(&hid);

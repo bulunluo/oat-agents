@@ -94,6 +94,9 @@ pub struct DispatchRecord {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// Prepared for an external driver, without a meta-agent tmux session.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub headless: bool,
 }
 
 impl DispatchRecord {
@@ -604,6 +607,8 @@ mod tests {
             "worktree": "/tmp/w", "branch": "oat/s3/w", "created_at": "2026-01-01T00:00:00Z",
         }))
         .unwrap();
+        assert!(!old.headless);
+        assert!(serde_json::to_value(&old).unwrap().get("headless").is_none());
         assert_eq!(old.hash_id(&run), crate::event_log::hash_id("worker", "s3-format-v6-parity", "dispatch-1"));
 
         let named = DispatchRecord { name: Some("s3-f8".to_string()), ..old.clone() };

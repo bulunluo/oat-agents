@@ -194,6 +194,7 @@ fn fixture() -> Fixture {
         name: None,
         model: None,
         effort: None,
+        headless: false,
     };
     store.create_dispatch(&meta).unwrap();
     store
@@ -683,6 +684,7 @@ fn a_linked_checklist_item_shows_its_work_and_flags_work_finished_but_unchecked(
         name: Some(name.to_string()),
         model: None,
         effort: None,
+        headless: false,
     };
     fx.store
         .create_dispatch(&dispatch("dispatch-g", "glaze", Some(crate::store::Settlement::Succeeded), true))
