@@ -119,12 +119,18 @@ impl Drop for PendingFile {
 }
 
 /// Updates trust under Claude's lock. Callers report errors without preventing launch.
+/// Use the launch Environment, which also supplies CLAUDE_CONFIG_DIR to the session
+/// through session_environment, rather than reading the oat process environment directly.
+/// Empty and absent values both become unset in launch.sh, so both fall back to HOME here.
 pub fn trust_claude_workspace(env: &dyn Environment, worktree: &Path) -> Result<()> {
-    let home = env
-        .home_dir()
+    let config_dir = env
+        .var("CLAUDE_CONFIG_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| env.home_dir())
         .context("home directory unavailable for Claude workspace trust")?;
-    let config = home.join(".claude.json");
-    let lock = ConfigLock::acquire(home.join(".claude.json.lock"))?;
+    let config = config_dir.join(".claude.json");
+    let lock = ConfigLock::acquire(config_dir.join(".claude.json.lock"))?;
     let result = (|| -> Result<()> {
         // Keep the configured link intact. Resolve only after acquiring the config lock.
         let path = match fs::symlink_metadata(&config) {

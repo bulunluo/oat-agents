@@ -179,11 +179,7 @@ pub fn open(env: &dyn Environment, repo: &Path, requested: Option<Backend>) -> R
     if let Some(e) = &model.reasoning_effort {
         env_vars.push(("OAT_EFFORT".to_string(), e.clone()));
     }
-    for name in launch::PASS_THROUGH_VARS {
-        if let Some(v) = env.var(name) {
-            env_vars.push((name.to_string(), v));
-        }
-    }
+    env_vars.extend(launch::session_environment(env));
 
     tmux.start_session(&session, &dir, &env_vars, &script_path.to_string_lossy())?;
 

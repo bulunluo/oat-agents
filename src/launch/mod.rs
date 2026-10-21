@@ -54,6 +54,11 @@ done
 unset oat_auth_name
 "#,
     );
+    // tmux receives explicit empty overrides for unset account variables. Restore absence
+    // before starting either backend, matching workspace trust's empty-value fallback.
+    for name in ACCOUNT_SCOPE_VARS {
+        script.push_str(&format!("[ -n \"${{{name}:-}}\" ] || unset {name}\n"));
+    }
     if backend == Backend::Claude {
         script.push_str(r#"if [ "${OAT_CLAUDE_TOKEN_FILE+x}" = x ]; then
   if [ ! -L "$OAT_CLAUDE_TOKEN_FILE" ] &&
@@ -85,18 +90,33 @@ unset oat_auth_metadata
     script
 }
 
-pub(crate) const PASS_THROUGH_VARS: &[&str] = &[
+const PASS_THROUGH_VARS: &[&str] = &[
     "OAT_AGENTS_LOG_DIR",
     "OAT_AGENTS_STATE_DIR",
     "OAT_AGENTS_CHECKLIST_DIR",
     "OAT_TMUX_COMMAND",
     "OAT_TMUX_SOCKET",
     "OAT_CLAUDE_COMMAND",
-    "OAT_CLAUDE_TOKEN_FILE",
     "OAT_CODEX_COMMAND",
+];
+
+const ACCOUNT_SCOPE_VARS: &[&str] = &[
     "CLAUDE_CONFIG_DIR",
+    "OAT_CLAUDE_TOKEN_FILE",
     "CODEX_HOME",
 ];
+
+/// Override account scope even when absent: otherwise tmux inherits the account that
+/// started its shared server. launch.sh turns empty overrides back into unset variables.
+pub(crate) fn session_environment(env: &dyn Environment) -> Vec<(String, String)> {
+    PASS_THROUGH_VARS
+        .iter()
+        .filter_map(|name| env.var(name).map(|value| (name.to_string(), value)))
+        .chain(ACCOUNT_SCOPE_VARS.iter().map(|name| {
+            (name.to_string(), env.var(name).unwrap_or_default())
+        }))
+        .collect()
+}
 
 /// Prepares a Dispatch, starts its tmux session, then records the successful launch.
 pub fn launch_dispatch(
@@ -322,11 +342,7 @@ pub fn start_dispatch(
     if let Some(e) = &dispatch.effort {
         env_vars.push(("OAT_EFFORT".to_string(), e.clone()));
     }
-    for name in PASS_THROUGH_VARS {
-        if let Some(v) = env.var(name) {
-            env_vars.push((name.to_string(), v));
-        }
-    }
+    env_vars.extend(session_environment(env));
 
     Tmux::from_env(env).start_session(
         &session,
@@ -359,6 +375,54 @@ mod tests {
     use super::*;
     use crate::environment::TestEnvironment;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn launch_unsets_empty_account_scope_and_preserves_nonempty_values() {
+        for backend in [Backend::Claude, Backend::Codex] {
+            for value in [None, Some(""), Some("configured-account")] {
+                let home = tempfile::tempdir().unwrap();
+                fs::write(home.path().join("prompt.md"), "Test prompt").unwrap();
+                let script = home.path().join("launch.sh");
+                fs::write(&script, launch_script(backend)).unwrap();
+                let agent = home.path().join("agent");
+                fs::write(&agent, r#"#!/bin/sh
+if [ "$EXPECT_SCOPE" = set ]; then
+  [ "$CLAUDE_CONFIG_DIR" = configured-account ] || exit 11
+  [ "$OAT_CLAUDE_TOKEN_FILE" = configured-account ] || exit 12
+  [ "$CODEX_HOME" = configured-account ] || exit 13
+else
+  [ "${CLAUDE_CONFIG_DIR+x}" != x ] || exit 14
+  [ "${OAT_CLAUDE_TOKEN_FILE+x}" != x ] || exit 15
+  [ "${CODEX_HOME+x}" != x ] || exit 16
+fi
+[ "${CLAUDE_CODE_OAUTH_TOKEN+x}" != x ] || exit 17
+"#).unwrap();
+                fs::set_permissions(&agent, fs::Permissions::from_mode(0o700)).unwrap();
+                let mut command = std::process::Command::new("/bin/sh");
+                command.arg(&script)
+                    .current_dir(home.path())
+                    .env_clear()
+                    .env("PATH", "/usr/bin:/bin")
+                    .env("HOME", home.path())
+                    .env("OAT_WORKTREE", home.path())
+                    .env("OAT_DISPATCH_DIR", home.path())
+                    .env("OAT_CLAUDE_COMMAND", &agent)
+                    .env("OAT_CODEX_COMMAND", &agent)
+                    .env("EXPECT_SCOPE", if value == Some("configured-account") { "set" } else { "unset" });
+                if let Some(value) = value {
+                    for name in ACCOUNT_SCOPE_VARS {
+                        command.env(name, value);
+                    }
+                }
+                let output = command.output().unwrap();
+                assert!(output.status.success(), "account scope was not normalized");
+                assert!(output.stdout.is_empty());
+                if value != Some("configured-account") || backend == Backend::Codex {
+                    assert!(output.stderr.is_empty(), "empty token paths must not cause a warning");
+                }
+            }
+        }
+    }
 
     #[test]
     fn launch_auth_hygiene_reads_only_private_owned_files_without_leaking() {
@@ -470,7 +534,7 @@ fi
                 assert!(!stderr.contains(&token));
                 assert!(!stderr.contains(&home.path().to_string_lossy().to_string()));
                 let warnings: Vec<_> = stderr.lines().filter(|line| *line != "+ set +x").collect();
-                if expected || case == "unset" || backend == Backend::Codex {
+                if expected || matches!(case, "unset" | "empty-path") || backend == Backend::Codex {
                     assert!(warnings.is_empty());
                 } else {
                     assert_eq!(warnings.len(), 1);
@@ -481,8 +545,8 @@ fi
                 }
             }
         }
-        assert!(PASS_THROUGH_VARS.contains(&"OAT_CLAUDE_TOKEN_FILE"));
-        assert!(PASS_THROUGH_VARS.contains(&"CLAUDE_CONFIG_DIR"));
+        assert!(ACCOUNT_SCOPE_VARS.contains(&"OAT_CLAUDE_TOKEN_FILE"));
+        assert!(ACCOUNT_SCOPE_VARS.contains(&"CLAUDE_CONFIG_DIR"));
     }
 
     #[test]

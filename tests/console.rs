@@ -7,6 +7,37 @@ use common::{PluginBuilder, TestWorld};
 use oat_agents::role::Backend;
 
 #[test]
+fn console_always_overrides_the_tmux_servers_account_scope() {
+    for backend in [Backend::Claude, Backend::Codex] {
+        for value in [None, Some(""), Some("configured-account")] {
+            let world = TestWorld::new();
+            let repo = tempfile::tempdir().unwrap();
+            common::install_console_plugin(&world, repo.path(), "Observe.");
+            let mut env = world.env();
+            let names = ["CLAUDE_CONFIG_DIR", "OAT_CLAUDE_TOKEN_FILE", "CODEX_HOME"];
+            let account = world.scratch.path().join("configured-account");
+            std::fs::create_dir(&account).unwrap();
+            let expected = match value {
+                Some("configured-account") => account.to_string_lossy().into_owned(),
+                _ => String::new(),
+            };
+            if value.is_some() {
+                for name in names {
+                    env = env.with_var(name, &expected);
+                }
+            }
+            oat_agents::console::open(&env, repo.path(), Some(backend)).unwrap();
+            let calls = world.tmux_calls();
+            let call = calls.iter().find(|call| call.contains("new-session")).unwrap();
+            for name in names {
+                assert!(call.contains(&format!("-e {name}={expected} ")));
+                assert_eq!(call.matches(&format!("-e {name}=")).count(), 1);
+            }
+        }
+    }
+}
+
+#[test]
 fn the_consoles_prompt_carries_the_catalogs_instructions_after_its_baseline() {
     let world = TestWorld::new();
     let env = world.env();
