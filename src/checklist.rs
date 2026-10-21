@@ -288,6 +288,7 @@ mod tests {
             pgid: None,
             started_at: None,
             identity_warning: None,
+            trust_warning: None,
         }
     }
 

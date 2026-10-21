@@ -312,10 +312,13 @@ fn launch(
         }
     };
 
+    let mut trust_warning = None;
     if backend == Backend::Claude {
         let _ = launch::write_claude_local_settings(&worktree_path);
         if request.trust_workspace {
-            let _ = launch::trust_claude_workspace(env, &worktree_path);
+            trust_warning = launch::trust_claude_workspace(env, &worktree_path)
+                .err()
+                .map(|error| format!("could not trust Claude workspace: {error:#}"));
         }
     }
 
@@ -354,6 +357,7 @@ fn launch(
         role_names_for_preamble: catalog.role_names(),
         created_fresh_worktree: created_fresh,
         repo: repo.clone(),
+        trust_warning,
     };
 
     let (dispatch, dispatch_dir) = launch::launch_dispatch(
@@ -400,6 +404,7 @@ fn launch(
         "attach": Tmux::from_env(env).attach_command(&session),
         "at": request.at,
         "dispatch_dir": dispatch_dir.to_string_lossy(),
+        "trust_warning": dispatch.trust_warning,
         "exec": env_binding.to_json(),
     }))
 }

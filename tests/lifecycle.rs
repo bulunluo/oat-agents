@@ -117,6 +117,46 @@ fn meta_fire_creates_a_run_a_worktree_and_a_session() {
 }
 
 #[test]
+fn trust_failures_warn_in_fire_output_and_dispatch_records_without_stopping_launch() {
+    use oat_agents::store::Store;
+    use std::time::{Duration, Instant};
+
+    let repo = TempRepo::new();
+    let world = TestWorld::new();
+    common::install_pottery_plugin(&world, &repo.path());
+    let env = world.env();
+    let catalog = fixture_catalog();
+    let lock = world.home.join(".claude.json.lock");
+    std::fs::create_dir(&lock).unwrap();
+    let started = Instant::now();
+    let meta = run_json(parse(&[
+        "meta", "fire", "--prompt", "plan", "--repo", &repo.path().to_string_lossy(),
+        "--name", "trust-warning", "--agent", "claude", "--trust-workspace",
+    ]), &env, &catalog);
+    assert!(started.elapsed() >= Duration::from_secs(5));
+    assert!(meta["trust_warning"].as_str().unwrap().contains("timed out"));
+    assert!(std::fs::symlink_metadata(&lock).unwrap().is_dir());
+    assert!(!world.home.join(".claude.json").exists());
+    std::fs::remove_dir(&lock).unwrap();
+
+    // A read error in a member launch also remains visible and releases the lock.
+    std::fs::create_dir(world.home.join(".claude.json")).unwrap();
+    let role_env = world.env().with_var("OAT_RUN_ID", "trust-warning");
+    let role = run_json(parse(&[
+        "role", "fire", "worker", "--name", "writer", "--prompt", "do work", "--trust-workspace",
+    ]), &role_env, &catalog);
+    assert!(role["trust_warning"].as_str().unwrap().contains("could not trust Claude workspace"));
+    assert!(!lock.exists());
+    for result in [&meta, &role] {
+        let recorded = Store::open(&env).unwrap().load_dispatch(
+            "trust-warning", result["dispatch_id"].as_str().unwrap()).unwrap();
+        assert_eq!(recorded.trust_warning.as_deref(), result["trust_warning"].as_str());
+        assert!(result["session"].is_string());
+    }
+    assert_eq!(world.tmux_calls().iter().filter(|call| call.contains("new-session")).count(), 2);
+}
+
+#[test]
 fn fresh_role_gets_its_own_child_worktree() {
     let repo = TempRepo::new();
     let world = TestWorld::new();

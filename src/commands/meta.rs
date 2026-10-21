@@ -119,10 +119,13 @@ fn fire(args: FireArgs, env: &dyn Environment) -> Result<Value> {
     let path = worktree::worktree_path(&repo, &run_id, "meta");
     worktree::create_worktree(&repo, &path, &branch, &base_commit)?;
 
+    let mut trust_warning = None;
     if backend == Backend::Claude {
         let _ = launch::write_claude_local_settings(&path);
         if args.trust_workspace {
-            let _ = launch::trust_claude_workspace(env, &path);
+            trust_warning = launch::trust_claude_workspace(env, &path)
+                .err()
+                .map(|error| format!("could not trust Claude workspace: {error:#}"));
         }
     }
 
@@ -200,6 +203,7 @@ fn fire(args: FireArgs, env: &dyn Environment) -> Result<Value> {
         role_names_for_preamble: catalog.role_names(),
         created_fresh_worktree: true,
         repo: repo.clone(),
+        trust_warning,
     };
 
     let model_env = (model.model.clone(), model.reasoning_effort.clone());
@@ -215,6 +219,7 @@ fn fire(args: FireArgs, env: &dyn Environment) -> Result<Value> {
         "worktree": dispatch.worktree,
         "branch": dispatch.branch,
         "dispatch_dir": dispatch_dir.to_string_lossy(),
+        "trust_warning": dispatch.trust_warning,
         "exec": exec.to_json(),
         "backend": run_record.backend,
         "role_limits": run_record.role_limits,

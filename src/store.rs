@@ -107,6 +107,9 @@ pub struct DispatchRecord {
     pub started_at: Option<String>,
     #[serde(default)]
     pub identity_warning: Option<String>,
+    /// Trust setup failed; the Dispatch still launched and may show Claude's trust dialog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_warning: Option<String>,
 }
 
 impl DispatchRecord {
