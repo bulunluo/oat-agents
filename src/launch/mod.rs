@@ -82,7 +82,7 @@ pub fn launch_dispatch(
     model_env: (Option<String>, Option<String>),
 ) -> Result<(DispatchRecord, PathBuf)> {
     Tmux::from_env(env).check_available()?;
-    let (dispatch, dispatch_dir) =
+    let (mut dispatch, dispatch_dir) =
         prepare_dispatch_files(store, &spec, dispatch_id, model_env, false)?;
     if let Err(e) = start_dispatch(env, &spec.run, &dispatch, &dispatch_dir) {
         if spec.created_fresh_worktree {
@@ -96,6 +96,7 @@ pub fn launch_dispatch(
         }
         return Err(e);
     }
+    capture_identity(&Tmux::from_env(env), &spec.run, &mut dispatch);
     record_dispatch(store, log, &dispatch)?;
     Ok((dispatch, dispatch_dir))
 }
@@ -215,8 +216,45 @@ fn prepare_dispatch_files(
         model,
         effort,
         headless,
+        pid: None,
+        pgid: None,
+        started_at: None,
+        identity_warning: None,
     };
     Ok((dispatch, dispatch_dir))
+}
+
+fn capture_identity(tmux: &Tmux, run: &RunRecord, dispatch: &mut DispatchRecord) {
+    let session = Tmux::session_name(&dispatch.hash_id(run));
+    dispatch.pid = tmux.pane_pid(&session);
+    let identity = dispatch.pid.ok_or_else(|| anyhow::anyhow!("tmux pane_pid unavailable"))
+        .and_then(process_identity);
+    match identity {
+        Ok((pgid, started_at)) => {
+            dispatch.pgid = Some(pgid);
+            dispatch.started_at = Some(started_at);
+        }
+        Err(error) => dispatch.identity_warning = Some(format!("could not capture process identity: {error}")),
+    }
+}
+
+fn process_identity(pid: u32) -> Result<(u32, String)> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "pgid=,lstart=", "-p", &pid.to_string()])
+        .env("LC_ALL", "C")
+        .output()?;
+    anyhow::ensure!(output.status.success(), "ps could not inspect pane pid {pid}");
+    parse_process_identity(std::str::from_utf8(&output.stdout)?)
+}
+
+fn parse_process_identity(text: &str) -> Result<(u32, String)> {
+    let text = text.trim();
+    let (pgid, started_at) = text.split_once(char::is_whitespace)
+        .ok_or_else(|| anyhow::anyhow!("ps returned no process start time"))?;
+    let pgid: u32 = pgid.parse()?;
+    let started_at = started_at.trim();
+    anyhow::ensure!(pgid > 0 && !started_at.is_empty(), "ps returned incomplete process identity");
+    Ok((pgid, started_at.to_string()))
 }
 
 fn record_dispatch(store: &Store, log: &EventLog, dispatch: &DispatchRecord) -> Result<()> {
@@ -322,6 +360,17 @@ pub fn write_claude_local_settings(worktree: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_identity_preserves_raw_start_time_and_rejects_missing_fields() {
+        assert_eq!(parse_process_identity("  123 Wed Oct  7 09:10:11 2026\n").unwrap(),
+            (123, "Wed Oct  7 09:10:11 2026".to_string()));
+        for invalid in ["", "123", "0 Wed Oct 7", "bad Wed Oct 7"] {
+            assert!(parse_process_identity(invalid).is_err());
+        }
+        let (pgid, started_at) = process_identity(std::process::id()).unwrap();
+        assert!(pgid > 0 && !started_at.is_empty());
+    }
 
     #[test]
     fn both_backends_start_interactive_so_the_session_outlives_its_first_turn() {

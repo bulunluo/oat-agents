@@ -97,6 +97,16 @@ pub struct DispatchRecord {
     /// Prepared for an external driver, without a meta-agent tmux session.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub headless: bool,
+    /// Best-effort identity captured immediately after tmux starts the Dispatch.
+    #[serde(default)]
+    pub pid: Option<u32>,
+    #[serde(default)]
+    pub pgid: Option<u32>,
+    /// Raw `ps lstart` text, whose local timezone cannot be recovered unambiguously.
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub identity_warning: Option<String>,
 }
 
 impl DispatchRecord {
@@ -443,6 +453,20 @@ impl Store {
         Ok(acked)
     }
 
+    /// Observes unanswered questions without delivering or acknowledging any inbox message.
+    pub fn waiting_on_meta(&self, run_id: &str) -> Result<std::collections::BTreeSet<String>> {
+        let mut waiting = std::collections::BTreeSet::new();
+        for seq in self.pending_seqs(run_id)? {
+            let message = self.read_message(run_id, seq)?;
+            if matches!(message.kind, MessageKind::Question)
+                && !self.inbox_dir(run_id).join(format!("{seq}.reply.json")).exists()
+            {
+                waiting.insert(message.dispatch_id);
+            }
+        }
+        Ok(waiting)
+    }
+
     /// Posts the meta-agent's reply to one message, so its sender's `wait_reply` sees it.
     pub fn reply_to_message(&self, run_id: &str, seq: u64, message: &str) -> Result<()> {
         // Confirms the message exists before writing a reply beside it.
@@ -486,6 +510,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::for_root(dir.path().join("runs"));
         (dir, store)
+    }
+
+    #[test]
+    fn waiting_questions_are_observed_even_after_delivery_and_acknowledgement() {
+        let (_dir, store) = store();
+        let question = store.append_inbox("run1", "d1", MessageKind::Question, "which?").unwrap();
+        store.append_inbox("run1", "d2", MessageKind::MemberDone, "done").unwrap();
+        let waiting = store.waiting_on_meta("run1").unwrap();
+        assert_eq!(waiting.into_iter().collect::<Vec<_>>(), vec!["d1"]);
+        let delivery = store.wait_inbox("run1", Duration::ZERO, Duration::ZERO).unwrap().unwrap();
+        assert_eq!(delivery.messages.len(), 2, "observation must not consume messages");
+        store.ack_inbox("run1", &delivery.delivery_id).unwrap();
+        assert!(store.waiting_on_meta("run1").unwrap().contains("d1"));
+        store.reply_to_message("run1", question, "blue").unwrap();
+        assert!(store.waiting_on_meta("run1").unwrap().is_empty());
     }
 
     #[test]
@@ -608,6 +647,8 @@ mod tests {
         }))
         .unwrap();
         assert!(!old.headless);
+        assert!(old.pid.is_none() && old.pgid.is_none() && old.started_at.is_none());
+        assert!(old.identity_warning.is_none());
         assert!(serde_json::to_value(&old).unwrap().get("headless").is_none());
         assert_eq!(old.hash_id(&run), crate::event_log::hash_id("worker", "s3-format-v6-parity", "dispatch-1"));
 

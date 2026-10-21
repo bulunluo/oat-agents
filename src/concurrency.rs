@@ -20,7 +20,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
 /// Every role's effective limit for a Run: the plugin's default, replaced by the repository's
@@ -244,11 +244,34 @@ impl Drop for QueueLock {
     }
 }
 
-/// Whether a process still exists. Where `/proc` is not available this cannot be told, and a
-/// claim is trusted rather than taken over.
+/// Probe existence without delivering a signal. Permission denial still proves existence.
 fn process_alive(pid: u32) -> bool {
-    if !Path::new("/proc/self").exists() {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false; // kill(0, ...) probes a process group, not a process.
+    }
+    // SAFETY: signal zero only probes the positive pid; no pointers or signal delivery.
+    if unsafe { libc::kill(pid, 0) } == 0 {
         return true;
     }
-    Path::new(&format!("/proc/{pid}")).exists()
+    // ESRCH is the only definitive absence; EPERM (and unexpected errors) retain the claim.
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn current_process_is_alive_and_reaped_child_is_dead() {
+        assert!(process_alive(std::process::id()));
+        let mut child = std::process::Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert!(!process_alive(pid));
+        assert!(!process_alive(0));
+        assert!(!process_alive(u32::MAX));
+    }
 }

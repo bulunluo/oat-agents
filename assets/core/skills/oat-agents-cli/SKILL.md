@@ -50,7 +50,17 @@ reports the backend it got. What a Run settled is in `meta fire`'s output under
 ## Observing a Run without taking it over
 
 - `dispatch show --dispatch <id> [--run <id>]` — a Dispatch's record and whether its session
-  is still alive.
+  is still alive. Its record includes `pid`, `pgid`, raw `ps` `started_at`, and
+  `identity_warning` if identity capture failed; unavailable identity fields are `null`.
+- `dispatch pulse --run <id> [--dispatch <id>]` — a JSON array with `dispatch_id`, `role`,
+  `settled`, `session_alive`, `pane_dead`, `last_output_at`, `transcript_path`,
+  `waiting_on_meta`, `headless`, and the recorded identity fields. Omit `--dispatch` for
+  all Dispatches, even when `OAT_DISPATCH_ID` is set. Unknown pane state or output time is
+  `null`; a headless Dispatch has no session. `last_output_at` is RFC3339, the newer of
+  tmux window activity and transcript mtime. Claude transcripts use
+  `$CLAUDE_CONFIG_DIR/projects` when set, otherwise `~/.claude/projects`; Codex has none.
+  `waiting_on_meta` means a question has no reply, even if its delivery was acknowledged.
+  Pulse observes structured data without interpreting pane text or consuming the inbox.
 - `dispatch read --dispatch <id> [--source auto|transcript|terminal] [--limit <n>]` — its
   transcript or terminal screen.
 - `log show [--run <id>] [--agent <name>] [--event <name>] [--since <ts>] [--limit <n>]

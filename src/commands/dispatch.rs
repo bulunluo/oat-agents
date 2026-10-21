@@ -22,6 +22,8 @@ pub enum DispatchCommand {
     Ask(AskArgs),
     /// A Dispatch's record and whether its session is still alive.
     Show(ShowArgs),
+    /// Observe structured liveness for every Dispatch, without consuming the Run inbox.
+    Pulse(PulseArgs),
     /// A Dispatch's transcript or terminal screen.
     Read(ReadArgs),
     /// End a Dispatch's session; with `--remove-worktree`, also remove its worktree.
@@ -62,6 +64,15 @@ pub struct ShowArgs {
     pub dispatch: Option<String>,
     #[arg(long)]
     pub run: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct PulseArgs {
+    #[arg(long)]
+    pub run: String,
+    /// Limit the array to this Dispatch. Omission always means the whole Run.
+    #[arg(long)]
+    pub dispatch: Option<String>,
 }
 
 #[derive(Args, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -114,6 +125,7 @@ pub fn run(command: DispatchCommand, env: &dyn Environment, exec: &dyn ExecEnvir
         DispatchCommand::Done(args) => done(args, env),
         DispatchCommand::Ask(args) => ask(args, env),
         DispatchCommand::Show(args) => show(args, env),
+        DispatchCommand::Pulse(args) => pulse(args, env),
         DispatchCommand::Read(args) => read(args, env),
         DispatchCommand::Release(args) => release(args, env, exec),
     }
@@ -234,6 +246,60 @@ fn show(args: ShowArgs, env: &dyn Environment) -> Result<Value> {
     }))
 }
 
+fn pulse(args: PulseArgs, env: &dyn Environment) -> Result<Value> {
+    let store = Store::open(env)?;
+    let run = store.load_run(&args.run)?;
+    let dispatches = match args.dispatch {
+        Some(id) => vec![store.load_dispatch(&args.run, &id)?],
+        None => store.list_dispatches(&args.run),
+    };
+    let waiting = store.waiting_on_meta(&args.run)?;
+    let tmux = Tmux::from_env(env);
+    let projects = crate::transcript::claude_projects_dir(env);
+    let mut result = Vec::new();
+    for dispatch in dispatches {
+        let session = Tmux::session_name(&dispatch.hash_id(&run));
+        let session_alive = !dispatch.headless && dispatch.released_at.is_none()
+            && tmux.session_alive(&session).unwrap_or(false);
+        let (pane_dead, activity) = if session_alive {
+            tmux.activity(&session)
+        } else {
+            (None, None)
+        };
+        let transcript = if dispatch.headless {
+            None
+        } else {
+            projects.as_ref().and_then(|root| {
+                crate::transcript::find_transcript(root, &dispatch.backend, &dispatch.worktree)
+            })
+        };
+        let modified = transcript.as_ref()
+            .and_then(|path| std::fs::metadata(path).ok()?.modified().ok());
+        result.push(json!({
+            "dispatch_id": dispatch.id,
+            "role": dispatch.role,
+            "settled": dispatch.is_settled(),
+            "session_alive": session_alive,
+            "pane_dead": pane_dead,
+            "last_output_at": last_output_at(activity, modified),
+            "transcript_path": transcript,
+            "waiting_on_meta": waiting.contains(&dispatch.id),
+            "pid": dispatch.pid,
+            "pgid": dispatch.pgid,
+            "started_at": dispatch.started_at,
+            "identity_warning": dispatch.identity_warning,
+            "headless": dispatch.headless,
+        }));
+    }
+    Ok(Value::Array(result))
+}
+
+fn last_output_at(activity: Option<i64>, modified: Option<std::time::SystemTime>) -> Option<String> {
+    let activity = activity.and_then(|seconds| chrono::DateTime::<chrono::Utc>::from_timestamp(seconds, 0));
+    let modified = modified.map(chrono::DateTime::<chrono::Utc>::from);
+    activity.max(modified).map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true))
+}
+
 fn read(args: ReadArgs, env: &dyn Environment) -> Result<Value> {
     let run_id = bound_run(&args.run, env)?;
     let dispatch_id = bound_dispatch(&args.dispatch, env)?;
@@ -338,4 +404,20 @@ fn release(args: ReleaseArgs, env: &dyn Environment, exec: &dyn ExecEnvironments
         "worktree": removal,
         "queue": queue,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn last_output_uses_the_newer_source_and_preserves_missing_sources() {
+        let mtime: SystemTime = UNIX_EPOCH + Duration::from_secs(20);
+        assert_eq!(last_output_at(Some(10), Some(mtime)).as_deref(), Some("1970-01-01T00:00:20Z"));
+        assert_eq!(last_output_at(Some(30), Some(mtime)).as_deref(), Some("1970-01-01T00:00:30Z"));
+        assert_eq!(last_output_at(None, Some(mtime)), last_output_at(Some(20), None));
+        assert_eq!(last_output_at(None, None), None);
+        assert_eq!(last_output_at(Some(i64::MAX), None), None);
+    }
 }

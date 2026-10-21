@@ -43,11 +43,26 @@ fn run(dir: &Path, args: &[&str]) {
 }
 
 /// Writes a recording tmux stand-in (ticket §7.1): it appends its whole argv to `log_path` and
-/// exits 0. No test in this crate needs a real model or a real tmux server.
+/// exits 0 for launches. Optional `tmux-pane-pid`, `tmux-activity`, and `tmux-session-dead`
+/// files in `scratch` control read-only queries. No test needs a real model or tmux server.
 pub fn tmux_stub(scratch: &Path, log_path: &Path) -> PathBuf {
     let script = scratch.join("fake-tmux.sh");
     let contents = format!(
-        "#!/bin/sh\numask 022\nprintf '%s\\n' \"$*\" >> \"{}\"\nexit 0\n",
+        r#"#!/bin/sh
+umask 022
+printf '%s\n' "$*" >> "{}"
+fixtures="$(dirname "$0")"
+case "$3" in
+  has-session) [ ! -f "$fixtures/tmux-session-dead" ]; exit $? ;;
+  display-message)
+    case "$7" in
+      '#{{pane_pid}}') cat "$fixtures/tmux-pane-pid" 2>/dev/null ;;
+      '#{{pane_dead}} #{{window_activity}}') cat "$fixtures/tmux-activity" 2>/dev/null ;;
+    esac
+    exit $? ;;
+esac
+exit 0
+"#,
         log_path.display()
     );
     std::fs::write(&script, contents).unwrap();

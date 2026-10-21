@@ -243,6 +243,18 @@ impl Tmux {
         (fields.next()? == "1").then_some((x, y))
     }
 
+    /// Read the agent pane's process id without changing the session.
+    pub fn pane_pid(&self, session: &str) -> Option<u32> {
+        self.display(session, "#{pane_pid}")?.trim().parse().ok().filter(|pid| *pid > 0)
+    }
+
+    /// Read structured pane death and window activity; unavailable values remain unknown.
+    pub fn activity(&self, session: &str) -> (Option<bool>, Option<i64>) {
+        self.display(session, "#{pane_dead} #{window_activity}")
+            .map(|text| parse_activity(&text))
+            .unwrap_or_default()
+    }
+
     fn display(&self, session: &str, format: &str) -> Option<String> {
         let output = self
             .checked(&["display-message", "-p", "-t", &pane(session), format])
@@ -272,4 +284,28 @@ fn failed(what: &str, output: &std::process::Output) -> anyhow::Error {
         codes::INTERNAL_ERROR,
         format!("tmux {what} failed: {}", String::from_utf8_lossy(&output.stderr).trim()),
     )
+}
+
+fn parse_activity(text: &str) -> (Option<bool>, Option<i64>) {
+    let mut fields = text.split_whitespace();
+    let dead = match fields.next() {
+        Some("0") => Some(false),
+        Some("1") => Some(true),
+        _ => None,
+    };
+    let activity = fields.next().and_then(|value| value.parse().ok()).filter(|epoch| *epoch > 0);
+    (dead, activity)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn activity_is_structured_and_missing_values_stay_unknown() {
+        assert_eq!(parse_activity("1 1700000000\n"), (Some(true), Some(1700000000)));
+        assert_eq!(parse_activity("0 0"), (Some(false), None));
+        assert_eq!(parse_activity("invalid nope"), (None, None));
+        assert_eq!(parse_activity(""), (None, None));
+    }
 }

@@ -27,7 +27,10 @@ fn slug(worktree_path: &str) -> String {
 }
 
 pub fn claude_projects_dir(env: &dyn Environment) -> Option<PathBuf> {
-    env.home_dir().map(|home| home.join(".claude").join("projects"))
+    env.var("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| env.home_dir().map(|home| home.join(".claude")))
+        .map(|config| config.join("projects"))
 }
 
 fn project_dir(projects_root: &Path, worktree_path: &str) -> Option<PathBuf> {
@@ -365,6 +368,15 @@ pub fn session(path: &Path) -> Session {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn projects_honor_claude_config_dir() {
+        let home = PathBuf::from("/test/home");
+        let env = crate::environment::TestEnvironment::new(home.clone());
+        assert_eq!(claude_projects_dir(&env), Some(home.join(".claude/projects")));
+        let env = env.with_var("CLAUDE_CONFIG_DIR", "/test/custom-claude");
+        assert_eq!(claude_projects_dir(&env), Some(PathBuf::from("/test/custom-claude/projects")));
+    }
 
     #[test]
     fn a_codex_dispatch_does_not_take_the_transcript_of_a_claude_one_in_its_worktree() {
