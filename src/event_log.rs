@@ -226,6 +226,7 @@ pub mod events {
     pub const DISPATCH_DEQUEUED: &str = "dispatch_dequeued";
     pub const QUEUED_LAUNCH_FAILED: &str = "queued_launch_failed";
     pub const DISPATCH_DROPPED: &str = "dispatch_dropped";
+    pub const DISPATCH_RELEASED: &str = "dispatch_released";
 }
 
 /// Milliseconds since the epoch, for the execution ledger's timestamps.

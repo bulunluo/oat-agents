@@ -24,7 +24,7 @@ pub enum MetaCommand {
     /// Start a Run from a goal: create the meta-agent's worktree and launch it in its own tmux
     /// session, unless `--headless` is set.
     Fire(FireArgs),
-    /// Close a Run whose Dispatches are settled and released, and print its receipt.
+    /// Close a Run, release its remaining member Dispatches, and print its receipt.
     Finish(FinishArgs),
 }
 
@@ -358,6 +358,42 @@ fn finish(args: FinishArgs, env: &dyn Environment, exec: &dyn ExecEnvironments) 
         details: None,
     })?;
 
+    // Stop member sessions before removing the worktrees they are running in. Each member
+    // is independent: a capture, save or logging failure must not prevent the others closing.
+    let mut closed_members = Vec::new();
+    for mut dispatch in store.list_dispatches(&run_id) {
+        if dispatch.released_at.is_some() || meta_dispatch_id.as_ref() == Some(&dispatch.id) {
+            continue;
+        }
+        let mut errors = super::dispatch::close_dispatch(env, &store, &run_record, &mut dispatch);
+        let released = match store.save_dispatch(&dispatch) {
+            Ok(()) => true,
+            Err(error) => {
+                errors.push(format!("save dispatch: {error:#}"));
+                false
+            }
+        };
+        let mut result = json!({
+            "dispatch_id": dispatch.id,
+            "released": released,
+            "errors": errors,
+        });
+        if released {
+            if let Err(error) = log.record(&LogEntry {
+                timestamp: now_iso(),
+                run_id: run_id.clone(),
+                dispatch_id: Some(dispatch.id.clone()),
+                agent: Some(dispatch.role.clone()),
+                event: events::DISPATCH_RELEASED.to_string(),
+                details: Some(result.clone()),
+            }) {
+                errors.push(format!("log release: {error:#}"));
+                result["errors"] = json!(errors);
+            }
+        }
+        closed_members.push(result);
+    }
+
     let cleanup = clean_run(env, &store, &run_id, false)?;
     // A closed Run has no Dispatch left to run a command in, so its pods are only cost.
     let environments = exec.remove_run(env, &log, &run_id);
@@ -366,6 +402,7 @@ fn finish(args: FinishArgs, env: &dyn Environment, exec: &dyn ExecEnvironments) 
         "closed_at": run_record.closed_at,
         "cleanup": cleanup,
         "environments": environments,
+        "closed_members": closed_members,
         "dropped_from_queue": dropped.iter().map(|entry| &entry.dispatch_id).collect::<Vec<_>>(),
     });
 

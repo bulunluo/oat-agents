@@ -6,7 +6,7 @@ use crate::environment::Environment;
 use crate::error::{codes, err};
 use crate::event_log::{events, now_iso, EventLog, LogEntry};
 use crate::session::tmux::Tmux;
-use crate::store::{MessageKind, Settlement, Store};
+use crate::store::{DispatchRecord, MessageKind, RunRecord, Settlement, Store};
 use crate::worktree;
 use anyhow::Result;
 use clap::{Args, Subcommand};
@@ -338,6 +338,43 @@ fn read(args: ReadArgs, env: &dyn Environment) -> Result<Value> {
     Err(err(codes::TRANSCRIPT_NOT_FOUND, "no transcript or terminal screen available"))
 }
 
+/// Close a Dispatch's terminal best-effort and mark it released in memory. The caller saves
+/// the record: `release` must still finish optional worktree removal before persisting it.
+/// Failures are returned for the finish receipt, but never prevent the remaining steps.
+pub(super) fn close_dispatch(
+    env: &dyn Environment,
+    store: &Store,
+    run_record: &RunRecord,
+    dispatch: &mut DispatchRecord,
+) -> Vec<String> {
+    let tmux = Tmux::from_env(env);
+    let hid = dispatch.hash_id(run_record);
+    let session = Tmux::session_name(&hid);
+    let mut errors = Vec::new();
+
+    match tmux.session_alive(&session) {
+        Ok(true) => {
+            match tmux.capture_pane(&session) {
+                Ok(text) => {
+                    let screen = store.dispatch_dir_path(&dispatch.run_id, &dispatch.id).join("screen.txt");
+                    if let Err(error) = std::fs::write(screen, text) {
+                        errors.push(format!("save screen: {error:#}"));
+                    }
+                }
+                Err(error) => errors.push(format!("capture pane: {error:#}")),
+            }
+            if let Err(error) = tmux.kill_session(&session) {
+                errors.push(format!("kill session: {error:#}"));
+            }
+        }
+        Ok(false) => {}
+        Err(error) => errors.push(format!("check session: {error:#}")),
+    }
+
+    dispatch.released_at = Some(now_iso());
+    errors
+}
+
 fn release(args: ReleaseArgs, env: &dyn Environment, exec: &dyn ExecEnvironments) -> Result<Value> {
     let run_id = bound_run(&args.run, env)?;
     let dispatch_id = bound_dispatch(&args.dispatch, env)?;
@@ -346,19 +383,7 @@ fn release(args: ReleaseArgs, env: &dyn Environment, exec: &dyn ExecEnvironments
     let run_record = store.load_run(&run_id)?;
     let mut dispatch = store.load_dispatch(&run_id, &dispatch_id)?;
 
-    let tmux = Tmux::from_env(env);
-    let hid = dispatch.hash_id(&run_record);
-    let session = Tmux::session_name(&hid);
-
-    if tmux.session_alive(&session).unwrap_or(false) {
-        if let Ok(text) = tmux.capture_pane(&session) {
-            let _ = std::fs::write(
-                store.dispatch_dir_path(&run_id, &dispatch_id).join("screen.txt"),
-                text,
-            );
-        }
-        let _ = tmux.kill_session(&session);
-    }
+    let _ = close_dispatch(env, &store, &run_record, &mut dispatch);
 
     let mut removal = None;
     if args.remove_worktree {
@@ -389,7 +414,6 @@ fn release(args: ReleaseArgs, env: &dyn Environment, exec: &dyn ExecEnvironments
         }
     }
 
-    dispatch.released_at = Some(now_iso());
     store.save_dispatch(&dispatch)?;
 
     // The release is done whatever the queue does; a failure to start what was waiting is
